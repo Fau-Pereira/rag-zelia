@@ -1,5 +1,6 @@
 import os
 import sys
+import hashlib
 import logging
 import time
 from dotenv import load_dotenv
@@ -7,7 +8,8 @@ from dotenv import load_dotenv
 # Esta seção importa as ferramentas necessárias para ler pastas, PDFs (com ou sem imagem)
 # e transformar os textos em vetores matemáticos (embeddings) que a IA entende.
 # ÚLTIMA ALTERAÇÃO: Substituímos o PyPDFLoader pelo DirectoryLoader e UnstructuredPDFLoader, e atualizamos o import do Chroma.
-from langchain_community.document_loaders import DirectoryLoader, UnstructuredPDFLoader
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, UnstructuredPDFLoader
+from langchain_community.vectorstores.utils import filter_complex_metadata
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
@@ -46,20 +48,38 @@ def processar_e_salvar_documentos(docs_dir: str, persist_directory: str):
             glob="**/*.pdf",
             loader_cls=UnstructuredPDFLoader,
             loader_kwargs={
+                "mode": "paged",
                 "strategy": "auto",
                 "languages": ["por"] # Avisa o OCR que o texto está em português!
             } 
         )
         documentos = loader.load()
     except Exception as e:
-        logging.error(f"Erro ao processar documentos: {e}")
-        return
+        logging.warning(f"Falha ao usar UnstructuredPDFLoader ({e}). Utilizando PyPDFLoader como fallback...")
+        try:
+            loader = DirectoryLoader(
+                docs_dir,
+                glob="**/*.pdf",
+                loader_cls=PyPDFLoader
+            )
+            documentos = loader.load()
+            for doc in documentos:
+                if "page" in doc.metadata and isinstance(doc.metadata["page"], int):
+                    doc.metadata["page"] = doc.metadata["page"] + 1
+        except Exception as fallback_err:
+            logging.error(f"Erro ao processar documentos: {fallback_err}")
+            return
     
     if not documentos:
         logging.warning("Nenhum documento encontrado na pasta.")
         return
         
     logging.info(f"Leitura concluída! {len(documentos)} blocos carregados.")
+
+    # Normaliza o metadado de página para garantir compatibilidade na citação de fontes
+    for doc in documentos:
+        if "page" not in doc.metadata and "page_number" in doc.metadata:
+            doc.metadata["page"] = doc.metadata["page_number"]
 
     # Divisão de Texto (Chunking): O modelo de IA tem um limite de leitura por vez.
     # Aqui "picotamos" os documentos em pedaços menores (1000 caracteres) com uma 
@@ -68,6 +88,7 @@ def processar_e_salvar_documentos(docs_dir: str, persist_directory: str):
     logging.info("Dividindo o texto em pedaços...")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs_divididos = text_splitter.split_documents(documentos)
+    docs_divididos = filter_complex_metadata(docs_divididos)
     logging.info(f"Os documentos foram divididos em {len(docs_divididos)} chunks.")
 
     # Embeddings: É o tradutor que converte nosso texto em coordenadas matemáticas espaciais.
@@ -90,15 +111,30 @@ def processar_e_salvar_documentos(docs_dir: str, persist_directory: str):
     tamanho_lote = 15
     for i in range(0, len(docs_divididos), tamanho_lote):
         lote = docs_divididos[i : i + tamanho_lote]
+        ids_lote = [
+            hashlib.sha256(
+                f"{doc.metadata.get('source', '')}:{doc.metadata.get('page', '')}:{idx}:{doc.page_content}".encode("utf-8")
+            ).hexdigest()
+            for idx, doc in enumerate(lote, start=i)
+        ]
         logging.info(f"Processando lote de chunks {i+1} até {min(i + tamanho_lote, len(docs_divididos))} de {len(docs_divididos)}...")
         
-        # Tenta adicionar os documentos. Se der erro de limite, espera mais um pouco.
-        try:
-            vector_store.add_documents(lote)
-        except Exception as e:
-            logging.warning(f"Limite da API atingido. Pausando por 60 segundos antes de tentar novamente... Erro: {e}")
-            time.sleep(60)
-            vector_store.add_documents(lote) # Tenta novamente após a pausa
+        # Tenta adicionar os documentos com múltiplas tentativas caso atinja o limite da API.
+        max_tentativas = 3
+        for tentativa in range(1, max_tentativas + 1):
+            try:
+                vector_store.add_documents(lote, ids=ids_lote)
+                break
+            except Exception as e:
+                if tentativa == max_tentativas:
+                    logging.error(f"Falha definitiva ao processar lote após {max_tentativas} tentativas: {e}")
+                    raise
+                tempo_espera = 60 * tentativa
+                logging.warning(
+                    f"Limite da API atingido (tentativa {tentativa}/{max_tentativas}). "
+                    f"Pausando por {tempo_espera} segundos antes de tentar novamente... Erro: {e}"
+                )
+                time.sleep(tempo_espera)
         
         if (i + tamanho_lote) < len(docs_divididos):
             logging.info("Pausa de 15 segundos para não exceder o limite da API (Free Tier)...")
